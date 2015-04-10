@@ -5,10 +5,14 @@ import threading
 import socket
 import json
 import os
+import ssl
+import sys
+import signal
 
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GObject
 import dbus
+import profig
 
 APPNAME = "com.vhakulinen.push-notification"
 INVOKED = "ActionInvoked"
@@ -17,7 +21,13 @@ BROWSER = "firefox"
 TIMEOUT = 5
 BUFSIZE = 1024
 
-BINDFILE = "/tmp/notification-socket"
+cfg = profig.Config("%s/.config/push-notify.conf" % os.getenv("HOME"))
+cfg.sync()
+
+HOST = cfg["default.host"]
+PORT = int(cfg["default.port"])
+ADDR = (HOST, PORT)
+TOKEN = cfg["default.token"]
 
 notification = None
 url = ""
@@ -28,35 +38,41 @@ count = 0
 class Receiver(threading.Thread):
     running = False
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, token, addr, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
-
-        if os.path.exists(BINDFILE):
-            os.remove(BINDFILE)
-        self.sock.bind(BINDFILE)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.token = token
+        self.addr = addr
 
     def run(self):
         self.running = True
-        self.sock.listen(1)
+        self.sock.connect(self.addr)
+        self.sock = ssl.wrap_socket(self.sock)
+        self.sock.send(self.token.encode("utf8"))
         while self.running:
-            try:
-                conn, _ = self.sock.accept()
-            except:
-                continue
-            raw = conn.recv(BUFSIZE)
-            conn.close()
+            raw = self.sock.recv(BUFSIZE)
 
-            data = ""
-            data = json.loads(raw.decode("UTF-8"))
-            if data and validate(data):
-                notify(data)
+            if raw:
+                if raw.startswith(b":PING"):
+                    msg = ":PONG %s\n" % raw.split()[1].decode("utf8")
+                    self.sock.send(msg.encode("utf8"))
+                    continue
+                data = ""
+                try:
+                    data = json.loads(raw.decode("UTF-8"))
+                except:
+                    print(raw.decode("UTF-8"))
+                    os.kill(os.getpid(), signal.SIGINT)
+                if data and validate(data):
+                    notify(data)
+            else:
+                self.running = False
+                continue
 
     def join(self, *args, **kwargs):
         self.running = False
         self.sock.shutdown(socket.SHUT_RDWR)
-        if os.path.exists(BINDFILE):
-            os.remove(BINDFILE)
+        self.sock.close()
         return super().join(*args, **kwargs)
 
 
@@ -116,7 +132,7 @@ if __name__ == "__main__":
                        '/org/freedesktop/Notifications'),
         'org.freedesktop.Notifications')
 
-    receiver = Receiver()
+    receiver = Receiver(TOKEN, (HOST, PORT))
     receiver.start()
 
     try:
